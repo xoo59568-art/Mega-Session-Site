@@ -1,6 +1,5 @@
 import express from "express";
 import fs from "fs";
-import axios from "axios";
 import pino from "pino";
 import pn from "awesome-phonenumber";
 import {
@@ -16,19 +15,24 @@ import { upload } from "./mega.js";
 
 const router = express.Router();
 
-/* -------------------- helpers -------------------- */
+/* ---------------- helpers ---------------- */
 
 function removeFile(path) {
   try {
     if (fs.existsSync(path)) {
       fs.rmSync(path, { recursive: true, force: true });
     }
-  } catch {}
+  } catch (e) {
+    console.log("Cleanup error:", e.message);
+  }
 }
 
+// Node 18+ / 20 built-in fetch (Render safe)
 async function getImageBuffer(url) {
-  const res = await axios.get(url, { responseType: "arraybuffer" });
-  return Buffer.from(res.data);
+  const res = await fetch(url);
+  if (!res.ok) throw new Error("Image download failed");
+  const arr = await res.arrayBuffer();
+  return Buffer.from(arr);
 }
 
 function getMegaFileId(url) {
@@ -36,19 +40,18 @@ function getMegaFileId(url) {
   return match ? match[1] : null;
 }
 
-/* -------------------- route -------------------- */
+/* ---------------- route ---------------- */
 
 router.get("/", async (req, res) => {
   let num = req.query.number;
-  if (!num) {
-    return res.status(400).send({ code: "Number required" });
-  }
+  if (!num) return res.status(400).send({ code: "Number required" });
 
   num = num.replace(/[^0-9]/g, "");
   const phone = pn("+" + num);
+
   if (!phone.isValid()) {
     return res.status(400).send({
-      code: "Invalid phone number (use full international number)",
+      code: "Invalid international number",
     });
   }
 
@@ -60,8 +63,8 @@ router.get("/", async (req, res) => {
   const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
   const { version } = await fetchLatestBaileysVersion();
 
-  let dpDone = false;
   let pairSent = false;
+  let dpDone = false;
 
   const sock = makeWASocket({
     version,
@@ -80,10 +83,12 @@ router.get("/", async (req, res) => {
 
   sock.ev.on("creds.update", saveCreds);
 
+  /* ---------------- connection events ---------------- */
+
   sock.ev.on("connection.update", async (update) => {
     const { connection, lastDisconnect } = update;
 
-    /* ---------- pair complete ---------- */
+    // ✅ Pair completed
     if (connection === "open" && !dpDone) {
       dpDone = true;
       console.log("✅ Pair completed");
@@ -91,21 +96,21 @@ router.get("/", async (req, res) => {
       try {
         await delay(3000);
 
-        // 🔹 DP image URL
+        // 🔹 DP image
         const imgUrl = "https://files.catbox.moe/d8z5wt.jpg";
         const imgBuffer = await getImageBuffer(imgUrl);
 
-        // 🔹 set DP
+        // 🔹 Set profile picture
         await sock.updateProfilePicture(sock.user.id, imgBuffer);
 
-        // 🔔 notification
+        // 🔔 Notification
         await sock.sendMessage(sock.user.id, {
           text: "🖼️ Profile picture updated successfully ✅",
         });
 
-        console.log("✅ DP set & notification sent");
+        console.log("🖼️ DP updated & notification sent");
 
-        // 🔹 upload creds to MEGA
+        // 🔹 Upload creds to MEGA
         const credsPath = sessionDir + "/creds.json";
         const megaUrl = await upload(
           credsPath,
@@ -123,20 +128,21 @@ router.get("/", async (req, res) => {
         console.log("🧹 Session cleaned");
 
       } catch (e) {
-        console.log("❌ Error after pair:", e.message);
+        console.log("❌ Post-pair error:", e.message);
       }
     }
 
-    /* ---------- reconnect ---------- */
+    // reconnect info
     if (connection === "close") {
       const code = lastDisconnect?.error?.output?.statusCode;
       if (code !== 401) {
-        console.log("🔁 Reconnecting...");
+        console.log("🔁 Connection closed, waiting...");
       }
     }
   });
 
-  /* ---------- request pairing code ---------- */
+  /* ---------------- pairing code ---------------- */
+
   if (!sock.authState.creds.registered) {
     await delay(3000);
     try {
@@ -149,9 +155,7 @@ router.get("/", async (req, res) => {
       }
     } catch (e) {
       if (!res.headersSent) {
-        res.status(503).send({
-          code: "Failed to get pairing code",
-        });
+        res.status(503).send({ code: "Pairing failed" });
       }
     }
   }
@@ -159,7 +163,7 @@ router.get("/", async (req, res) => {
 
 export default router;
 
-/* -------------------- safety -------------------- */
+/* ---------------- safety ---------------- */
 
 process.on("uncaughtException", (err) => {
   const e = String(err);
@@ -170,5 +174,5 @@ process.on("uncaughtException", (err) => {
     e.includes("rate-overlimit")
   )
     return;
-  console.log("Unhandled:", err);
+  console.log("Unhandled exception:", err);
 });
